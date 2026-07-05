@@ -1,1 +1,2 @@
 # base-pr
+retry deploy
