@@ -229,6 +229,11 @@ function getDispositivo(){
 // (Implementa → Nuova implementazione → App web → copia l'URL che finisce con /exec)
 const BACKEND_URL = 'https://script.google.com/macros/s/AKfycbwR2e66Pso9sfSLUekZTDGQ3DazoZsIw2SffZDH8GRp93nZg-h4RwLqbSv9Ywv6OHpo_Q/exec';
 
+// credenziali del login corrente, da passare alle chiamate protette
+function creds(){
+  return [sessionStorage.getItem('base_username'), sessionStorage.getItem('base_token')];
+}
+
 async function callServer(fn, ...args){
   // POST "semplice": NON impostiamo header Content-Type, così il browser NON
   // fa la richiesta di preflight OPTIONS — che Apps Script non sa gestire e
@@ -359,13 +364,13 @@ function App(){
 
   async function loadData(){
     try{
-      const data = await callServer('apiGetPublicBootstrap');
+      const data = await callServer('apiGetPublicBootstrap', ...creds());
       const sorted = data.events.slice().sort((a,b)=> a.date.localeCompare(b.date));
       setEvents(sorted);
       if(sorted.length > 0){
         const todayStr = new Date().toISOString().slice(0,10);
         const next = sorted.find(e => e.date >= todayStr) || sorted[sorted.length-1];
-        const ev = await callServer('apiGetPublicEvent', next.id);
+        const ev = await callServer('apiGetPublicEvent', next.id, ...creds());
         setCurrentEventId(next.id);
         setCurrentEvent(ev);
       }
@@ -376,7 +381,7 @@ function App(){
     if(authState !== 'ok' || !currentEventId) return;
     const interval = setInterval(async()=>{
       try{
-        const ev = await callServer('apiGetPublicEvent', currentEventId);
+        const ev = await callServer('apiGetPublicEvent', currentEventId, ...creds());
         setCurrentEvent(ev);
       }catch(err){}
     }, 8000);
@@ -386,7 +391,7 @@ function App(){
   async function switchEvent(id){
     setQuery('');
     if(id === currentEventId) return;
-    const ev = await callServer('apiGetPublicEvent', id);
+    const ev = await callServer('apiGetPublicEvent', id, ...creds());
     setCurrentEventId(id);
     setCurrentEvent(ev);
   }
