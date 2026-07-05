@@ -255,6 +255,60 @@ async function callServer(fn, ...args){
   return json.data;
 }
 
+/* ---- FACE ID / IMPRONTA (WebAuthn) ----
+ * Sblocco biometrico locale: dopo il primo login con password, il PR può
+ * registrare una credenziale biometrica su QUESTO dispositivo. La chiave
+ * privata resta nel secure enclave del telefono; lo sblocco richiede il
+ * volto/impronta reali. Il token di sessione viene rivelato solo dopo che
+ * la biometria è passata. Tutto lato browser: nessuna modifica al backend. */
+async function faceIdDisponibile(){
+  try{
+    return !!(window.PublicKeyCredential
+      && await PublicKeyCredential.isUserVerifyingPlatformAuthenticatorAvailable());
+  }catch(e){ return false; }
+}
+function _b64(buf){ return btoa(String.fromCharCode.apply(null, new Uint8Array(buf))); }
+function _unb64(s){ return Uint8Array.from(atob(s), c => c.charCodeAt(0)); }
+
+async function registraFaceId(username, token){
+  const cred = await navigator.credentials.create({
+    publicKey: {
+      challenge: crypto.getRandomValues(new Uint8Array(32)),
+      rp: { name: 'BASE' },
+      user: {
+        id: new TextEncoder().encode(username || 'utente'),
+        name: username || 'utente',
+        displayName: username || 'utente',
+      },
+      pubKeyCredParams: [{ type:'public-key', alg:-7 }, { type:'public-key', alg:-257 }],
+      authenticatorSelection: { authenticatorAttachment:'platform', userVerification:'required' },
+      timeout: 60000,
+    }
+  });
+  localStorage.setItem('base_fid_cred', _b64(cred.rawId));
+  localStorage.setItem('base_fid_user', username);
+  localStorage.setItem('base_fid_token', token);
+}
+
+async function sbloccaFaceId(){
+  const credId = localStorage.getItem('base_fid_cred');
+  if(!credId) throw new Error('nessuna credenziale');
+  await navigator.credentials.get({
+    publicKey: {
+      challenge: crypto.getRandomValues(new Uint8Array(32)),
+      allowCredentials: [{ type:'public-key', id:_unb64(credId) }],
+      userVerification: 'required',
+      timeout: 60000,
+    }
+  });
+  return { username: localStorage.getItem('base_fid_user'), token: localStorage.getItem('base_fid_token') };
+}
+function dimenticaFaceId(){
+  localStorage.removeItem('base_fid_cred');
+  localStorage.removeItem('base_fid_user');
+  localStorage.removeItem('base_fid_token');
+}
+
 /* ---- WATERMARK ---- */
 function Watermark({nome}){
   const label = nome.toUpperCase();
@@ -278,6 +332,34 @@ function LoginScreen({onLogin}){
   const [password, setPassword] = useState('');
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
+  const [hasFaceId, setHasFaceId] = useState(false); // credenziale salvata su questo device
+  const [faceAvail, setFaceAvail] = useState(false); // il device supporta la biometria
+  const [pending, setPending] = useState(null);      // {nome,isAdmin} in attesa della scelta "attiva Face ID?"
+  const [fidBusy, setFidBusy] = useState(false);
+  const [showPassword, setShowPassword] = useState(false); // mostra il form password al posto di Face ID
+  const autoTried = React.useRef(false);
+
+  useEffect(()=>{
+    setHasFaceId(!!localStorage.getItem('base_fid_cred'));
+    faceIdDisponibile().then(setFaceAvail);
+  }, []);
+
+  // al ritorno, se il Face ID è salvato prova a farlo partire da solo.
+  // Su Android parte liscio; su iPhone Apple richiede un tocco, quindi in
+  // caso di blocco resta semplicemente il bottone (nessun errore mostrato).
+  useEffect(()=>{
+    if(hasFaceId && !autoTried.current){
+      autoTried.current = true;
+      accediConFaceId(true);
+    }
+  }, [hasFaceId]);
+
+  function salvaSessione(u, token, nome, isAdmin){
+    sessionStorage.setItem('base_token', token);
+    sessionStorage.setItem('base_username', u);
+    sessionStorage.setItem('base_nome', nome);
+    sessionStorage.setItem('base_isAdmin', isAdmin ? '1' : '0');
+  }
 
   async function handleLogin(){
     if(!username.trim() || !password.trim()){ setError('Inserisci username e password'); return; }
@@ -287,11 +369,13 @@ function LoginScreen({onLogin}){
       const dispositivo = getDispositivo();
       const result = await callServer('apiLogin', username.trim(), password.trim(), dispositivo);
       if(result.ok){
-        sessionStorage.setItem('base_token', result.token);
-        sessionStorage.setItem('base_username', username.trim().toLowerCase());
-        sessionStorage.setItem('base_nome', result.nome);
-        sessionStorage.setItem('base_isAdmin', result.isAdmin ? '1' : '0');
-        onLogin(result.nome, result.isAdmin);
+        salvaSessione(username.trim().toLowerCase(), result.token, result.nome, result.isAdmin);
+        // se il device supporta la biometria e non è ancora attivata, proponila
+        if(faceAvail && !localStorage.getItem('base_fid_cred')){
+          setPending({ nome: result.nome, isAdmin: result.isAdmin });
+        } else {
+          onLogin(result.nome, result.isAdmin);
+        }
       } else if(result.bloccato){
         setError('Accesso non autorizzato — questo account è già attivo su un altro dispositivo.');
       } else {
@@ -301,6 +385,41 @@ function LoginScreen({onLogin}){
       setError('Errore di connessione: ' + err.message);
     }finally{
       setLoading(false);
+    }
+  }
+
+  // sblocco con Face ID: biometria → verifica token sul server → entra.
+  // silent=true (auto-avvio): se fallisce non mostra errori, resta il bottone.
+  async function accediConFaceId(silent){
+    setFidBusy(true); setError('');
+    try{
+      const { username: u, token } = await sbloccaFaceId();
+      const result = await callServer('apiVerifyToken', u, token, getDispositivo());
+      if(result.valid){
+        salvaSessione(u, token, result.nome, result.isAdmin);
+        onLogin(result.nome, result.isAdmin);
+      } else {
+        dimenticaFaceId();
+        setHasFaceId(false);
+        setShowPassword(true);
+        setError('Sessione scaduta: rifai l\'accesso con la password.');
+      }
+    }catch(err){
+      if(!silent) setError('Face ID non riuscito. Usa la password.');
+    }finally{
+      setFidBusy(false);
+    }
+  }
+
+  async function attivaFaceId(){
+    setFidBusy(true); setError('');
+    try{
+      await registraFaceId(sessionStorage.getItem('base_username'), sessionStorage.getItem('base_token'));
+    }catch(err){
+      // se l'utente annulla o fallisce, entra comunque: il Face ID è opzionale
+    }finally{
+      setFidBusy(false);
+      onLogin(pending.nome, pending.isAdmin);
     }
   }
 
@@ -314,22 +433,63 @@ function LoginScreen({onLogin}){
             <div className="login-sub">Disponibilità tavoli</div>
           </div>
         </div>
-        <div className="field">
-          <label>Username</label>
-          <input value={username} onChange={e=>setUsername(e.target.value)}
-            placeholder="Il tuo username" autoCapitalize="none" autoCorrect="off" />
-        </div>
-        <div className="field">
-          <label>Password</label>
-          <input type="password" value={password} onChange={e=>setPassword(e.target.value)}
-            placeholder="••••••••"
-            onKeyDown={e=>e.key==='Enter' && handleLogin()} />
-        </div>
-        <button className="btn-login" onClick={handleLogin} disabled={loading}>
-          {loading ? <Icon name="loader-2" /> : <Icon name="lock" />}
-          {loading ? 'Accesso in corso…' : 'Accedi'}
-        </button>
-        {error && <div className="login-error">{error}</div>}
+
+        {pending ? (
+          <React.Fragment>
+            <div style={{fontSize:14, color:'var(--text-dim)', textAlign:'center', margin:'4px 0 18px'}}>
+              Vuoi entrare con <b style={{color:'var(--text)'}}>Face ID / impronta</b> nei prossimi accessi, senza ridigitare la password?
+            </div>
+            <button className="btn-login" onClick={attivaFaceId} disabled={fidBusy}>
+              {fidBusy ? <Icon name="loader-2" /> : <Icon name="lock" />}
+              {fidBusy ? 'Attivazione…' : 'Attiva Face ID'}
+            </button>
+            <button onClick={()=>onLogin(pending.nome, pending.isAdmin)}
+              style={{width:'100%', background:'transparent', border:'none', color:'var(--text-dim)', padding:'12px', marginTop:6, cursor:'pointer', fontSize:13}}>
+              Non ora
+            </button>
+            {error && <div className="login-error">{error}</div>}
+          </React.Fragment>
+        ) : (hasFaceId && !showPassword) ? (
+          <React.Fragment>
+            <div style={{fontSize:13, color:'var(--text-dim)', textAlign:'center', margin:'2px 0 16px'}}>
+              Sblocca con il tuo volto o la tua impronta
+            </div>
+            <button className="btn-login" onClick={()=>accediConFaceId(false)} disabled={fidBusy}>
+              {fidBusy ? <Icon name="loader-2" /> : <Icon name="lock" />}
+              {fidBusy ? 'Verifica…' : 'Accedi con Face ID'}
+            </button>
+            <button onClick={()=>{ setError(''); setShowPassword(true); }}
+              style={{width:'100%', background:'transparent', border:'none', color:'var(--text-dim)', padding:'12px', marginTop:6, cursor:'pointer', fontSize:13}}>
+              Usa la password
+            </button>
+            {error && <div className="login-error">{error}</div>}
+          </React.Fragment>
+        ) : (
+          <React.Fragment>
+            <div className="field">
+              <label>Username</label>
+              <input value={username} onChange={e=>setUsername(e.target.value)}
+                placeholder="Il tuo username" autoCapitalize="none" autoCorrect="off" />
+            </div>
+            <div className="field">
+              <label>Password</label>
+              <input type="password" value={password} onChange={e=>setPassword(e.target.value)}
+                placeholder="••••••••"
+                onKeyDown={e=>e.key==='Enter' && handleLogin()} />
+            </div>
+            <button className="btn-login" onClick={handleLogin} disabled={loading}>
+              {loading ? <Icon name="loader-2" /> : <Icon name="lock" />}
+              {loading ? 'Accesso in corso…' : 'Accedi'}
+            </button>
+            {hasFaceId && (
+              <button onClick={()=>{ setError(''); setShowPassword(false); }}
+                style={{width:'100%', background:'transparent', border:'none', color:'var(--text-dim)', padding:'12px', marginTop:6, cursor:'pointer', fontSize:13}}>
+                ← Torna a Face ID
+              </button>
+            )}
+            {error && <div className="login-error">{error}</div>}
+          </React.Fragment>
+        )}
       </div>
     </div>
   );
